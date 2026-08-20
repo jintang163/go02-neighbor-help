@@ -1,0 +1,6 @@
+data/
+*.exe
+*.test
+*.out
+.DS_Store
+tmp/

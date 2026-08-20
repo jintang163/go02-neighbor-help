@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>邻里互助 · 登录</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="auth-page">
+    <div class="auth-card">
+      <h1>邻里互助平台</h1>
+      <p class="subtitle">居民发布求助或提供帮助，完成后互相评价</p>
+      <div class="tabs">
+        <button class="btn active" id="tab-login" type="button">登录</button>
+        <button class="btn" id="tab-reg" type="button">注册</button>
+      </div>
+      <form id="login-form" class="form" style="margin-top:16px">
+        <label class="field"><span>用户名</span><input name="username" required /></label>
+        <label class="field"><span>口令</span><input name="password" type="password" required /></label>
+        <button class="btn btn-primary" type="submit">登录</button>
+      </form>
+      <form id="reg-form" class="form hidden" style="margin-top:16px">
+        <label class="field"><span>用户名</span><input name="username" required /></label>
+        <label class="field"><span>显示名</span><input name="display_name" required /></label>
+        <label class="field"><span>口令</span><input name="password" type="password" required /></label>
+        <div class="row">
+          <label class="field"><span>楼栋</span><input name="building" /></label>
+          <label class="field"><span>单元</span><input name="unit" /></label>
+        </div>
+        <button class="btn btn-primary" type="submit">注册并登录</button>
+      </form>
+      <p class="err" id="err"></p>
+      <p class="subtitle">演示账号：alice / alice123，管理员 admin / admin123</p>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+  <script>
+    const loginForm = $("login-form"), regForm = $("reg-form"), err = $("err");
+    $("tab-login").onclick = () => { loginForm.classList.remove("hidden"); regForm.classList.add("hidden"); $("tab-login").classList.add("active"); $("tab-reg").classList.remove("active"); };
+    $("tab-reg").onclick = () => { regForm.classList.remove("hidden"); loginForm.classList.add("hidden"); $("tab-reg").classList.add("active"); $("tab-login").classList.remove("active"); };
+    async function afterAuth(data) {
+      setToken(data.token);
+      location.href = data.user.role === "admin" ? "/admin" : "/app";
+    }
+    loginForm.onsubmit = async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const fd = new FormData(loginForm);
+      try { await afterAuth(await api("/api/auth/login", { method:"POST", body: JSON.stringify({username:fd.get("username"), password:fd.get("password")}) })); }
+      catch (ex) { err.textContent = ex.message; }
+    };
+    regForm.onsubmit = async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const fd = new FormData(regForm);
+      try {
+        await afterAuth(await api("/api/auth/register", { method:"POST", body: JSON.stringify({
+          username: fd.get("username"), password: fd.get("password"), display_name: fd.get("display_name"),
+          building: fd.get("building"), unit: fd.get("unit"), role: "resident"
+        })}));
+      } catch (ex) { err.textContent = ex.message; }
+    };
+  </script>
+</body>
+</html>

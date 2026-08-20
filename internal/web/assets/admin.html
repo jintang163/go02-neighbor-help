@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>管理后台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar"><div class="brand">邻里互助 · 后台</div><div class="nav" id="userbar"></div></header>
+  <main class="layout">
+    <section class="card"><h2>全站统计</h2><div class="stats-grid" id="stats"></div></section>
+    <section class="card">
+      <div class="card-head"><h2>用户</h2>
+        <form id="newu" class="filters">
+          <input name="username" placeholder="用户名" required />
+          <input name="display_name" placeholder="显示名" required />
+          <input name="password" placeholder="口令" required />
+          <button class="btn btn-primary" type="submit">创建居民</button>
+        </form>
+      </div>
+      <div class="table-wrap"><table class="table" id="users"></table></div>
+    </section>
+    <section class="card"><h2>待处理举报</h2><div id="reports" class="list"></div></section>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    if (!requireLogin()) {}
+    async function init() {
+      const me = await currentMe();
+      if (me.user.role !== "admin") { location.href="/app"; return; }
+      fillUserBar(me);
+      const s = await api("/api/stats");
+      $("stats").innerHTML = Object.entries({
+        用户:s.user_total, 活跃:s.user_active, 帖子:s.post_total, 开放:s.post_open,
+        完成任务:s.task_completed, 完成率:Math.round((s.complete_rate||0)*100)+"%",
+        均分:(s.avg_review_score||0).toFixed(1), 待举报:s.pending_reports
+      }).map(([k,v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+      const users = await api("/api/users");
+      $("users").innerHTML = "<tr><th>用户</th><th>角色</th><th>状态</th><th>信用</th><th></th></tr>" +
+        (users.items||[]).map(u => `<tr><td>${u.display_name} (${u.username})</td><td>${u.role}</td><td>${u.status}</td>
+          <td>${u.credit_score}</td><td>${u.role==="resident"?(u.status==="frozen"
+            ?`<button class="btn" onclick="unfreeze('${u.id}')">解冻</button>`
+            :`<button class="btn btn-danger" onclick="freeze('${u.id}')">冻结</button>`):""}</td></tr>`).join("");
+      const reps = await api("/api/reports?status=pending");
+      $("reports").innerHTML = (reps.items||[]).map(r => `<div class="post">
+        <div class="meta">${r.target_type} ${r.target_id} · ${r.reason}</div>
+        <p>${r.detail||""}</p>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="handle('${r.id}','accept')">成立</button>
+          <button class="btn" onclick="handle('${r.id}','reject')">驳回</button>
+        </div></div>`).join("") || "<p>暂无待处理举报</p>";
+      $("newu").onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData($("newu"));
+        await api("/api/users", { method:"POST", body: JSON.stringify({
+          username:fd.get("username"), display_name:fd.get("display_name"), password:fd.get("password"), role:"resident"
+        })});
+        location.reload();
+      };
+    }
+    window.freeze = async (id) => { await api("/api/users/"+id+"/freeze", {method:"POST"}); location.reload(); };
+    window.unfreeze = async (id) => { await api("/api/users/"+id+"/unfreeze", {method:"POST"}); location.reload(); };
+    window.handle = async (id, action) => {
+      await api("/api/reports/"+id+"/handle", { method:"POST", body: JSON.stringify({action, freeze: action==="accept", note:"后台处理"}) });
+      location.reload();
+    };
+    init().catch(err => { alert(err.message); if (String(err.message).includes("unauthorized")) location.href="/login"; });
+  </script>
+</body>
+</html>

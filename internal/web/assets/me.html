@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>我的邻里</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar"><div class="brand">邻里互助</div><div class="nav" id="userbar"></div></header>
+  <main class="layout">
+    <section class="card">
+      <h2>个人资料</h2>
+      <form id="profile" class="form"></form>
+    </section>
+    <section class="card"><h2>待办</h2><div class="stats-grid" id="todo"></div></section>
+    <section class="card"><h2>我的任务</h2><div id="tasks" class="list"></div></section>
+    <section class="card"><h2>通知</h2><div id="notifs" class="list"></div></section>
+    <section class="card"><h2>信用流水</h2><div id="logs" class="list"></div></section>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    if (!requireLogin()) {}
+    async function init() {
+      const me = await currentMe();
+      fillUserBar(me);
+      const u = me.user;
+      $("profile").innerHTML = `
+        <div class="row"><label class="field"><span>显示名</span><input name="display_name" value="${u.display_name||""}"></label>
+        <label class="field"><span>楼栋</span><input name="building" value="${u.building||""}"></label></div>
+        <div class="row"><label class="field"><span>单元</span><input name="unit" value="${u.unit||""}"></label>
+        <label class="field"><span>房号</span><input name="room" value="${u.room||""}"></label></div>
+        <label class="field"><span>简介</span><input name="bio" value="${u.bio||""}"></label>
+        <button class="btn btn-primary" type="submit">保存</button>`;
+      $("todo").innerHTML = `
+        <div class="stat"><div class="k">未读通知</div><div class="v">${me.unread_notify}</div></div>
+        <div class="stat"><div class="k">待开始</div><div class="v">${me.pending_start}</div></div>
+        <div class="stat"><div class="k">待确认</div><div class="v">${me.pending_confirm}</div></div>
+        <div class="stat"><div class="k">待评价</div><div class="v">${me.pending_review}</div></div>`;
+      $("profile").onsubmit = async (e) => {
+        e.preventDefault();
+        const fd = new FormData($("profile"));
+        await api("/api/me/profile", { method:"PUT", body: JSON.stringify(Object.fromEntries(fd.entries())) });
+        alert("已保存");
+      };
+      const tasks = await api("/api/me/tasks");
+      $("tasks").innerHTML = (tasks.items||[]).map(t => `
+        <div class="post"><a href="/posts/${t.post_id}">${t.post.title}</a>
+          <div class="meta">${t.status} · 对方 ${t.requester_id===u.id?t.helper.display_name:t.requester.display_name}</div></div>`).join("") || "<p>暂无任务</p>";
+      const ns = await api("/api/me/notifications");
+      $("notifs").innerHTML = (ns.items||[]).map(n => `<div class="post"><b>${n.title}</b><p>${n.body}</p></div>`).join("") || "<p>暂无通知</p>";
+      const logs = await api("/api/me/credit-logs");
+      $("logs").innerHTML = (logs.items||[]).map(l => `<div class="post">${l.reason} ${l.delta>0?"+":""}${l.delta} → ${l.score_after}</div>`).join("") || "<p>暂无流水</p>";
+    }
+    init().catch(err => { if (String(err.message).includes("unauthorized")) location.href="/login"; else alert(err.message); });
+  </script>
+</body>
+</html>

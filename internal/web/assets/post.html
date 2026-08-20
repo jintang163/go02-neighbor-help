@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>互助详情</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar"><div class="brand">邻里互助</div><div class="nav" id="userbar"></div></header>
+  <main class="layout">
+    <section class="card" id="post"></section>
+    <section class="card" id="apps-card" class="hidden"><h2>报名</h2><div id="apps"></div></section>
+    <section class="card" id="task-card" class="hidden"><h2>履约任务</h2><div id="task"></div></section>
+    <section class="card">
+      <h2>留言</h2>
+      <div id="msgs" class="list"></div>
+      <form id="msg-form" class="form" style="margin-top:12px">
+        <textarea name="content" placeholder="说点什么…"></textarea>
+        <button class="btn" type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    if (!requireLogin()) {}
+    const id = location.pathname.split("/").pop();
+    let me = null, post = null;
+    async function init() {
+      me = await currentMe();
+      fillUserBar(me);
+      post = await api("/api/posts/" + id);
+      renderPost();
+      await loadMsgs();
+      if (me.user.id === post.author_id || me.user.role === "admin") await loadApps();
+      if (post.task_id) await loadTask();
+    }
+    function renderPost() {
+      $("post").innerHTML = `
+        <h2>${post.title} <span class="tag">${post.type==="request"?"求助":"帮助"}</span>
+          <span class="tag">${urgLabel(post.urgency)}</span> <span class="tag">${post.status}</span></h2>
+        <div class="meta"><span>${catLabel(post.category)}</span><span>作者 ${post.author?.display_name}</span>
+          <span>信用 ${post.author?.credit_score}</span></div>
+        <p>${post.content}</p>
+        <div class="actions">
+          ${me.user.id !== post.author_id && post.status==="open" ? '<button class="btn btn-primary" id="btn-apply">我要报名</button>' : ""}
+          ${me.user.id === post.author_id && post.status==="open" ? '<button class="btn btn-danger" id="btn-cancel">取消帖子</button>' : ""}
+          ${me.user.id !== post.author_id ? '<button class="btn" id="btn-fav">收藏</button>' : ""}
+        </div>`;
+      const ba = $("btn-apply"); if (ba) ba.onclick = apply;
+      const bc = $("btn-cancel"); if (bc) bc.onclick = async () => { await api("/api/posts/"+id+"/cancel", {method:"POST", body:"{}"}); location.reload(); };
+      const bf = $("btn-fav"); if (bf) bf.onclick = async () => { await api("/api/posts/"+id+"/favorite", {method:"POST"}); alert("已收藏"); };
+    }
+    async function apply() {
+      const message = prompt("给作者的一句话（可空）") || "";
+      await api("/api/posts/"+id+"/apply", { method:"POST", body: JSON.stringify({message}) });
+      alert("已报名"); location.reload();
+    }
+    async function loadApps() {
+      const data = await api("/api/posts/"+id+"/applications");
+      $("apps-card").classList.remove("hidden");
+      $("apps").innerHTML = (data.items||[]).map(a => `
+        <div class="post"><div class="meta">${a.applicant.display_name} · 信用 ${a.applicant.credit_score} · ${a.status}</div>
+          <p>${a.message||""}</p>
+          ${a.status==="pending"?`<div class="actions">
+            <button class="btn btn-primary" onclick="accept('${a.id}')">接受</button>
+            <button class="btn" onclick="reject('${a.id}')">拒绝</button></div>`:""}
+        </div>`).join("") || "<p>暂无报名</p>";
+    }
+    window.accept = async (aid) => { await api("/api/applications/"+aid+"/accept", {method:"POST"}); location.reload(); };
+    window.reject = async (aid) => { await api("/api/applications/"+aid+"/reject", {method:"POST"}); location.reload(); };
+    async function loadTask() {
+      const t = await api("/api/tasks/"+post.task_id);
+      $("task-card").classList.remove("hidden");
+      const uid = me.user.id;
+      let btns = "";
+      if (t.status==="pending_start") btns += '<button class="btn btn-primary" onclick="act(\'confirm-start\')">确认开始</button>';
+      if (t.status==="in_progress" && uid===t.helper_id) btns += '<button class="btn btn-primary" onclick="act(\'complete\')">标记完成</button>';
+      if (t.status==="pending_confirm" && uid===t.requester_id) {
+        btns += '<button class="btn btn-primary" onclick="act(\'confirm-complete\')">确认完成</button>';
+        btns += '<button class="btn btn-danger" onclick="dispute()">提出争议</button>';
+      }
+      if (t.status==="completed" && ((uid===t.requester_id && !t.requester_reviewed)||(uid===t.helper_id && !t.helper_reviewed)))
+        btns += '<button class="btn btn-primary" onclick="review()">评价对方</button>';
+      $("task").innerHTML = `<p>状态 ${t.status} · 求助方 ${t.requester.display_name} · 帮助方 ${t.helper.display_name}</p>
+        <div class="actions">${btns}</div>`;
+    }
+    window.act = async (p) => { await api("/api/tasks/"+post.task_id+"/"+p, {method:"POST"}); location.reload(); };
+    window.dispute = async () => {
+      const reason = prompt("争议原因"); if (!reason) return;
+      await api("/api/tasks/"+post.task_id+"/dispute", {method:"POST", body: JSON.stringify({reason})}); location.reload();
+    };
+    window.review = async () => {
+      const score = Number(prompt("星级 1-5", "5"));
+      const comment = prompt("评语") || "";
+      const tags = score>=4 ? ["kind"] : (score<=2 ? ["late"] : ["average"]);
+      await api("/api/tasks/"+post.task_id+"/reviews", {method:"POST", body: JSON.stringify({score, comment, tags})});
+      alert("评价已提交"); location.reload();
+    };
+    async function loadMsgs() {
+      const data = await api("/api/posts/"+id+"/messages");
+      $("msgs").innerHTML = (data.items||[]).map(m => `<div class="post"><div class="meta">${m.author.display_name}</div><p>${m.content}</p></div>`).join("") || "<p>还没有留言</p>";
+    }
+    $("msg-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const content = new FormData($("msg-form")).get("content");
+      await api("/api/posts/"+id+"/messages", {method:"POST", body: JSON.stringify({content})});
+      $("msg-form").reset(); await loadMsgs();
+    };
+    init().catch(err => { alert(err.message); if (String(err.message).includes("unauthorized")) location.href="/login"; });
+  </script>
+</body>
+</html>

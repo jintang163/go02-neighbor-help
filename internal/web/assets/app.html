@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>邻里互助 · 广场</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">邻里互助</div>
+    <div class="nav" id="userbar"></div>
+  </header>
+  <main class="layout">
+    <section class="card">
+      <div class="card-head"><h2>发布互助</h2></div>
+      <form id="create" class="form">
+        <div class="row">
+          <label class="field"><span>类型</span>
+            <select name="type"><option value="request">求助</option><option value="offer">提供帮助</option></select>
+          </label>
+          <label class="field"><span>分类</span><select name="category" id="cat"></select></label>
+        </div>
+        <div class="row">
+          <label class="field"><span>紧急</span>
+            <select name="urgency"><option value="low">不急</option><option value="normal" selected>普通</option><option value="high">较急</option><option value="urgent">紧急</option></select>
+          </label>
+          <label class="field"><span>楼栋</span><input name="building" /></label>
+        </div>
+        <label class="field"><span>标题</span><input name="title" required maxlength="80" /></label>
+        <label class="field"><span>详情</span><textarea name="content" required></textarea></label>
+        <button class="btn btn-primary" type="submit">发布到广场</button>
+        <p class="err" id="cerr"></p>
+      </form>
+    </section>
+    <section class="card">
+      <div class="card-head">
+        <h2>互助广场</h2>
+        <div class="filters">
+          <select id="f-type"><option value="">全部类型</option><option value="request">求助</option><option value="offer">提供帮助</option></select>
+          <select id="f-cat"><option value="">全部分类</option></select>
+          <input id="f-q" placeholder="关键词" class="input" />
+          <button class="btn" type="button" id="reload">筛选</button>
+        </div>
+      </div>
+      <div class="list" id="list"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    if (!requireLogin()) {}
+    let dict = { categories: [] };
+    async function init() {
+      const me = await currentMe();
+      fillUserBar(me);
+      dict = await api("/api/categories");
+      const catSel = $("cat"), fcat = $("f-cat");
+      dict.categories.forEach(c => {
+        catSel.insertAdjacentHTML("beforeend", `<option value="${c.id}">${c.label}</option>`);
+        fcat.insertAdjacentHTML("beforeend", `<option value="${c.id}">${c.label}</option>`);
+      });
+      await load();
+    }
+    async function load() {
+      const qs = new URLSearchParams({ plaza: "true" });
+      if ($("f-type").value) qs.set("type", $("f-type").value);
+      if ($("f-cat").value) qs.set("category", $("f-cat").value);
+      if ($("f-q").value) qs.set("q", $("f-q").value);
+      const data = await api("/api/posts?" + qs.toString());
+      const box = $("list");
+      box.innerHTML = (data.items || []).map(p => `
+        <article class="post">
+          <h3><a href="/posts/${p.id}">${p.title}</a>
+            <span class="tag ${p.type==="offer"?"offer":""}">${p.type==="request"?"求助":"帮助"}</span>
+            <span class="tag ${p.urgency==="urgent"||p.urgency==="high"?"urgent":""}">${urgLabel(p.urgency)}</span>
+          </h3>
+          <div class="meta">
+            <span>${catLabel(p.category)}</span>
+            <span>${p.author?.display_name || ""}</span>
+            <span>${p.building ? p.building+"栋" : ""}</span>
+            <span>报名 ${p.apply_count}</span>
+          </div>
+          <p>${p.content}</p>
+        </article>`).join("") || "<p class='subtitle'>暂无开放互助</p>";
+    }
+    $("reload").onclick = load;
+    $("create").onsubmit = async (e) => {
+      e.preventDefault(); $("cerr").textContent = "";
+      const fd = new FormData($("create"));
+      try {
+        await api("/api/posts", { method:"POST", body: JSON.stringify({
+          type: fd.get("type"), category: fd.get("category"), urgency: fd.get("urgency"),
+          title: fd.get("title"), content: fd.get("content"), building: fd.get("building"),
+          publish: true
+        })});
+        $("create").reset();
+        await load();
+      } catch (ex) { $("cerr").textContent = ex.message; }
+    };
+    init().catch(err => { if (String(err.message).includes("unauthorized")) location.href="/login"; else alert(err.message); });
+  </script>
+</body>
+</html>

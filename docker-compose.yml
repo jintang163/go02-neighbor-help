@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    image: go02-neighbor-help:latest
+    container_name: go02-neighbor-help
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - APP_ADDR=:8080
+      - APP_DATA_PATH=/app/data/store.json
+      - APP_ADMIN_USERNAME=admin
+      - APP_ADMIN_PASSWORD=admin123
+      - APP_SESSION_TTL=24h
+      - APP_SEED_ADMIN=true
+      - APP_SEED_DEMO=true
+    restart: unless-stopped
