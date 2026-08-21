@@ -36,6 +36,10 @@ type Store interface {
 	GetTaskByPost(ctx context.Context, postID string) (model.Task, error)
 	ListTasksByUser(ctx context.Context, userID string) ([]model.Task, error)
 	UpdateTask(ctx context.Context, t model.Task) (model.Task, error)
+	// ConfirmTaskStart 在同一把写锁内完成“确认开始”的状态推进，避免两个参与方
+	// 并发确认时各自基于旧副本回写而互相覆盖。asAdmin 为 true 时同时确认双方。
+	// 第二个返回值表示本次调用是否把任务推进到了 in_progress。
+	ConfirmTaskStart(ctx context.Context, taskID, actorID string, asAdmin bool) (model.Task, bool, error)
 	CountActiveTasksByUser(ctx context.Context, userID string) (int, error)
 	CountTasks(ctx context.Context) (total, completed, disputed int, err error)
 	CountTasksCreatedOn(ctx context.Context, day time.Time) (int, error)

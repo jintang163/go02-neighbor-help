@@ -49,36 +49,15 @@ func (t *TaskService) ConfirmStart(ctx context.Context, actor model.User, id str
 	if err := requireActiveWriter(actor); err != nil {
 		return model.TaskView{}, err
 	}
-	task, err := t.mustParty(ctx, actor, id)
+	// 在同一把写锁内完成“设置己方确认 + 双方都确认后推进到 in_progress +
+	// 同步帖子状态”，避免两个参与方并发确认时各自基于旧副本回写而互相覆盖。
+	updated, activated, err := t.store.ConfirmTaskStart(ctx, id, actor.ID, actor.IsAdmin())
 	if err != nil {
 		return model.TaskView{}, err
 	}
-	if task.Status != model.TaskPendingStart {
-		return model.TaskView{}, model.ErrInvalidTaskStatus
-	}
-	switch actor.ID {
-	case task.RequesterID:
-		task.RequesterStarted = true
-	case task.HelperID:
-		task.HelperStarted = true
-	}
-	if actor.IsAdmin() {
-		task.RequesterStarted = true
-		task.HelperStarted = true
-	}
-	if task.RequesterStarted && task.HelperStarted {
-		now := t.clock.Now()
-		task.Status = model.TaskInProgress
-		task.StartAt = &now
-		if err := t.syncPostStatus(ctx, task, model.PostInProgress); err != nil {
-			return model.TaskView{}, err
-		}
-		t.notify.Push(ctx, task.RequesterID, model.NotifyTaskStarted, "互助已开始", "双方已确认开始。", task.ID, "task")
-		t.notify.Push(ctx, task.HelperID, model.NotifyTaskStarted, "互助已开始", "双方已确认开始。", task.ID, "task")
-	}
-	updated, err := t.store.UpdateTask(ctx, task)
-	if err != nil {
-		return model.TaskView{}, err
+	if activated {
+		t.notify.Push(ctx, updated.RequesterID, model.NotifyTaskStarted, "互助已开始", "双方已确认开始。", updated.ID, "task")
+		t.notify.Push(ctx, updated.HelperID, model.NotifyTaskStarted, "互助已开始", "双方已确认开始。", updated.ID, "task")
 	}
 	return t.view(ctx, updated)
 }

@@ -15,31 +15,30 @@ import (
 type synchronizedTaskStore struct {
 	store.Store
 	mu      sync.Mutex
-	gets    int
-	allRead chan struct{}
+	entered int
+	allIn   chan struct{}
 }
 
 func newSynchronizedTaskStore(base store.Store) *synchronizedTaskStore {
-	return &synchronizedTaskStore{Store: base, allRead: make(chan struct{})}
+	return &synchronizedTaskStore{Store: base, allIn: make(chan struct{})}
 }
 
-func (s *synchronizedTaskStore) GetTask(ctx context.Context, id string) (model.Task, error) {
-	task, err := s.Store.GetTask(ctx, id)
-	if err != nil {
-		return model.Task{}, err
-	}
+// ConfirmTaskStart 是 ConfirmStart 的真正临界区入口。这里用屏障制造并发：
+// 两个参与方都进入后才开始各自调用底层 store，从而真正触发“先后进入、
+// 各自回写”的竞争窗口，用来验证 MemoryStore.ConfirmTaskStart 的原子性。
+func (s *synchronizedTaskStore) ConfirmTaskStart(ctx context.Context, taskID, actorID string, asAdmin bool) (model.Task, bool, error) {
 	s.mu.Lock()
-	s.gets++
-	if s.gets == 2 {
-		close(s.allRead)
+	s.entered++
+	if s.entered == 2 {
+		close(s.allIn)
 	}
 	s.mu.Unlock()
 	select {
-	case <-s.allRead:
-		return task, nil
+	case <-s.allIn:
 	case <-ctx.Done():
-		return model.Task{}, ctx.Err()
+		return model.Task{}, false, ctx.Err()
 	}
+	return s.Store.ConfirmTaskStart(ctx, taskID, actorID, asAdmin)
 }
 
 func setup(t *testing.T) (context.Context, *service.Services, *store.MemoryStore) {

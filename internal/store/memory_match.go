@@ -250,6 +250,55 @@ func (s *MemoryStore) CountTasksCreatedOn(ctx context.Context, day time.Time) (i
 	return n, nil
 }
 
+// ConfirmTaskStart 在同一把写锁内推进“确认开始”，避免两个参与方并发确认时
+// 各自基于旧副本回写而互相覆盖。仅 pending_start 允许确认；任一方重复确认无副作用。
+// 返回更新后的任务，以及本次调用是否将任务推进到 in_progress。
+func (s *MemoryStore) ConfirmTaskStart(ctx context.Context, taskID, actorID string, asAdmin bool) (model.Task, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return model.Task{}, false, err
+	}
+	s.mu.Lock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return model.Task{}, false, model.ErrNotFound
+	}
+	// 锁内再次校验状态，避免在 GetTask 与本调用之间被取消/推进。
+	if task.Status != model.TaskPendingStart {
+		s.mu.Unlock()
+		return model.Task{}, false, model.ErrInvalidTaskStatus
+	}
+	if !asAdmin && !task.IsParty(actorID) {
+		s.mu.Unlock()
+		return model.Task{}, false, model.ErrNotTaskParty
+	}
+
+	now := s.now()
+	if asAdmin || task.RequesterID == actorID {
+		task.RequesterStarted = true
+	}
+	if asAdmin || task.HelperID == actorID {
+		task.HelperStarted = true
+	}
+
+	activated := false
+	if task.RequesterStarted && task.HelperStarted {
+		task.Status = model.TaskInProgress
+		task.StartAt = &now
+		activated = true
+		if p, ok := s.posts[task.PostID]; ok {
+			p.Status = model.PostInProgress
+			p.UpdatedAt = now
+			s.posts[task.PostID] = p
+		}
+	}
+	task.UpdatedAt = now
+	s.tasks[task.ID] = task
+	s.mu.Unlock()
+	s.afterWrite()
+	return task, activated, nil
+}
+
 // AcceptMatch 同一把锁内完成匹配，避免双开。
 func (s *MemoryStore) AcceptMatch(ctx context.Context, appID, actorID string, asAdmin bool) (model.Application, model.Task, model.HelpPost, error) {
 	if err := ctx.Err(); err != nil {
