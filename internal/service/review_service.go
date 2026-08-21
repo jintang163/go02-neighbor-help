@@ -59,8 +59,13 @@ func (r *ReviewService) Submit(ctx context.Context, actor model.User, taskID str
 	if err != nil {
 		return model.Review{}, err
 	}
+	// 信用账本写入是评价流程中最易失败的一步。若它失败但评价记录已落库，
+	// (task, from) 槽位会被占用，导致重试被 ErrAlreadyReviewed 拒绝，而信用分
+	// 实际并未变化——卡在不可重试的半成功状态。这里删除刚创建的评价记录以
+	// 释放槽位并回滚评分副作用，使整体可安全重试。信用写入本身失败，无需冲销。
 	delta := model.CreditDeltaForScore(in.Score)
 	if _, err := r.credit.Apply(ctx, created.ToUserID, delta, model.CreditReviewReceived, created.ID, "收到评价"); err != nil {
+		_ = r.store.DeleteReview(ctx, created.ID)
 		return model.Review{}, err
 	}
 	r.notify.Push(ctx, created.ToUserID, model.NotifyReviewed, "收到新评价", actor.DisplayName+" 给你打了 "+itoa(in.Score)+" 星", created.ID, "review")

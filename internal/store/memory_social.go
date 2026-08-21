@@ -44,6 +44,46 @@ func (s *MemoryStore) CreateReview(ctx context.Context, r model.Review) (model.R
 	return r, nil
 }
 
+// DeleteReview 是 CreateReview 的逆操作：删除评价记录并释放 (task, from) 槽位，
+// 同时回滚被评人的评价计数/总分与任务上的评价标记。仅用于评价流程后续步骤
+// （如信用账本写入）失败时的补偿，保证槽位不被占用、可重新提交。
+func (s *MemoryStore) DeleteReview(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	r, ok := s.reviews[id]
+	if !ok {
+		s.mu.Unlock()
+		return model.ErrNotFound
+	}
+	now := s.now()
+	delete(s.reviews, id)
+	delete(s.reviewIdx, reviewKey(r.TaskID, r.FromUserID))
+	if u, ok := s.users[r.ToUserID]; ok {
+		if u.ReviewCount > 0 {
+			u.ReviewCount--
+		}
+		u.ReviewSum -= r.Score
+		u.UpdatedAt = now
+		s.users[r.ToUserID] = u
+	}
+	if t, ok := s.tasks[r.TaskID]; ok {
+		if r.FromUserID == t.RequesterID {
+			t.RequesterReviewed = false
+		}
+		if r.FromUserID == t.HelperID {
+			t.HelperReviewed = false
+		}
+		t.BothReviewed = false
+		t.UpdatedAt = now
+		s.tasks[r.TaskID] = t
+	}
+	s.mu.Unlock()
+	s.afterWrite()
+	return nil
+}
+
 func (s *MemoryStore) GetReview(ctx context.Context, id string) (model.Review, error) {
 	if err := ctx.Err(); err != nil {
 		return model.Review{}, err

@@ -50,6 +50,10 @@ type Store interface {
 	ListReviewsByTask(ctx context.Context, taskID string) ([]model.Review, error)
 	ListReviewsToUser(ctx context.Context, userID string) ([]model.Review, error)
 	UpdateReview(ctx context.Context, r model.Review) (model.Review, error)
+	// DeleteReview 删除评价记录并回滚 CreateReview 产生的副作用（占用槽位、
+	// 被评人评价计数/总分、任务评价标记），用于评价流程中后续步骤（如信用账本
+	// 写入）失败时的补偿，使整体提交可安全重试。
+	DeleteReview(ctx context.Context, id string) error
 	CountReviews(ctx context.Context) (count int, sum int, err error)
 
 	CreateMessage(ctx context.Context, m model.Message) (model.Message, error)
