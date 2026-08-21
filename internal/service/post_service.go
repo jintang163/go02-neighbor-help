@@ -221,11 +221,37 @@ func (p *PostService) ForceClose(ctx context.Context, actor model.User, id, reas
 	if err != nil {
 		return model.HelpPost{}, err
 	}
+	// 先改帖子为 closed 并落库，再作废其下待处理报名。报名状态持久化失败时按原值
+	// 回退帖子，使帖子和报名保持一致且可安全重试；否则帖子已变 closed 终态而报名仍
+	// pending，申请人仍可撤回这条报名，导致关闭后的关联流程仍可操作。
+	prevStatus := post.Status
+	prevReason := post.ClosedReason
 	post.Status = model.PostClosed
 	post.ClosedReason = reason
 	updated, err := p.store.UpdatePost(ctx, post)
 	if err != nil {
 		return model.HelpPost{}, err
+	}
+	rollback := func() {
+		post.Status = prevStatus
+		post.ClosedReason = prevReason
+		_, _ = p.store.UpdatePost(ctx, post)
+	}
+	apps, err := p.store.ListApplicationsByPost(ctx, post.ID)
+	if err != nil {
+		rollback()
+		return model.HelpPost{}, err
+	}
+	for _, a := range apps {
+		if a.Status != model.AppPending {
+			continue
+		}
+		a.Status = model.AppRejected
+		if _, err := p.store.UpdateApplication(ctx, a); err != nil {
+			rollback()
+			return model.HelpPost{}, err
+		}
+		p.notify.Push(ctx, a.ApplicantID, model.NotifyRejected, "报名已失效", "管理员关闭了互助帖："+post.Title, post.ID, "post")
 	}
 	p.notify.Push(ctx, post.AuthorID, model.NotifySystem, "帖子已被管理员关闭", reason, post.ID, "post")
 	return updated, nil
