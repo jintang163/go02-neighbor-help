@@ -23,7 +23,14 @@ type synchronizedTaskStore struct {
 var (
 	errRequesterCreditWrite = errors.New("credit store write failed for requester: durable log unavailable")
 	errHelperCreditWrite    = errors.New("credit store write failed for helper: durable log unavailable")
+	errPostStatusWrite      = errors.New("post store write failed during mark complete: disk sync unavailable")
 )
+
+type failPostUpdateStore struct{ store.Store }
+
+func (s *failPostUpdateStore) UpdatePost(ctx context.Context, post model.HelpPost) (model.HelpPost, error) {
+	return model.HelpPost{}, errPostStatusWrite
+}
 
 // failFirstCreditStore 让 ApplyCredit 第一次调用即失败，用于验证帮助方信用写入
 // 失败时不会留下任何部分提交（此时尚未推进任务/帖子终态，也无需冲销）。
@@ -436,5 +443,49 @@ func TestConfirmCompleteHelperCreditFailureKeepsWorkflowRetryable(t *testing.T) 
 	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
 	if storedTask.Status != model.TaskPendingConfirm || storedPost.Status != model.PostPendingConfirm || aliceAfter.CreditScore != aliceBefore.CreditScore || bobAfter.CreditScore != bobBefore.CreditScore {
 		t.Fatalf("helper-credit failure left partial state: task=%s post=%s requester_credit=%d->%d helper_credit=%d->%d error=%v", storedTask.Status, storedPost.Status, aliceBefore.CreditScore, aliceAfter.CreditScore, bobBefore.CreditScore, bobAfter.CreditScore, completionErr)
+	}
+}
+
+func TestMarkCompleteFailureKeepsTaskRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+	post, err := setupServices.Post.Create(ctx, alice, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "标记完成失败恢复", Content: "帖子状态失败时任务仍应可以重试", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := setupServices.Match.Accept(ctx, alice, app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupServices.Task.ConfirmStart(ctx, alice, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupServices.Task.ConfirmStart(ctx, bob, task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	failingServices := service.NewServices(&failPostUpdateStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, markErr := failingServices.Task.MarkComplete(ctx, bob, task.ID)
+	if !errors.Is(markErr, errPostStatusWrite) {
+		t.Fatalf("want post status failure %q, got %v", errPostStatusWrite, markErr)
+	}
+	storedTask, err := mem.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedPost, err := mem.GetPost(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress {
+		t.Fatalf("failed mark complete left workflow inconsistent: task=%s post=%s error=%v", storedTask.Status, storedPost.Status, markErr)
 	}
 }
