@@ -134,19 +134,37 @@ func (p *PostService) Cancel(ctx context.Context, actor model.User, id string, r
 	if post.Status == model.PostInProgress || post.Status == model.PostPendingConfirm || post.Status == model.PostMatched {
 		return model.HelpPost{}, model.ErrConflict
 	}
+	// 先改帖子为 cancelled 并落库，再作废其下待处理报名。报名状态持久化失败时按原值
+	// 回退帖子，使帖子和报名保持一致且可安全重试；否则帖子已变 cancelled 终态而报名仍
+	// pending，再次取消会被上面的终态校验拒绝，双方状态分裂且死锁。
+	prevStatus := post.Status
+	prevReason := post.ClosedReason
 	post.Status = model.PostCancelled
 	post.ClosedReason = reason
 	updated, err := p.store.UpdatePost(ctx, post)
 	if err != nil {
 		return model.HelpPost{}, err
 	}
-	apps, _ := p.store.ListApplicationsByPost(ctx, post.ID)
+	rollback := func() {
+		post.Status = prevStatus
+		post.ClosedReason = prevReason
+		_, _ = p.store.UpdatePost(ctx, post)
+	}
+	apps, err := p.store.ListApplicationsByPost(ctx, post.ID)
+	if err != nil {
+		rollback()
+		return model.HelpPost{}, err
+	}
 	for _, a := range apps {
-		if a.Status == model.AppPending {
-			a.Status = model.AppRejected
-			_, _ = p.store.UpdateApplication(ctx, a)
-			p.notify.Push(ctx, a.ApplicantID, model.NotifyRejected, "报名已失效", "作者取消了互助帖："+post.Title, post.ID, "post")
+		if a.Status != model.AppPending {
+			continue
 		}
+		a.Status = model.AppRejected
+		if _, err := p.store.UpdateApplication(ctx, a); err != nil {
+			rollback()
+			return model.HelpPost{}, err
+		}
+		p.notify.Push(ctx, a.ApplicantID, model.NotifyRejected, "报名已失效", "作者取消了互助帖："+post.Title, post.ID, "post")
 	}
 	return updated, nil
 }
