@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,36 @@ import (
 	"go02-neighbor-help/internal/service"
 	"go02-neighbor-help/internal/store"
 )
+
+type synchronizedTaskStore struct {
+	store.Store
+	mu      sync.Mutex
+	gets    int
+	allRead chan struct{}
+}
+
+func newSynchronizedTaskStore(base store.Store) *synchronizedTaskStore {
+	return &synchronizedTaskStore{Store: base, allRead: make(chan struct{})}
+}
+
+func (s *synchronizedTaskStore) GetTask(ctx context.Context, id string) (model.Task, error) {
+	task, err := s.Store.GetTask(ctx, id)
+	if err != nil {
+		return model.Task{}, err
+	}
+	s.mu.Lock()
+	s.gets++
+	if s.gets == 2 {
+		close(s.allRead)
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.allRead:
+		return task, nil
+	case <-ctx.Done():
+		return model.Task{}, ctx.Err()
+	}
+}
 
 func setup(t *testing.T) (context.Context, *service.Services, *store.MemoryStore) {
 	t.Helper()
@@ -188,5 +219,56 @@ func TestCancelAfterStartDeductsCredit(t *testing.T) {
 	after, _ := svc.User.GetByID(ctx, bob.ID)
 	if after.CreditScore != before.CreditScore-3 {
 		t.Fatalf("credit %d -> %d", before.CreditScore, after.CreditScore)
+	}
+}
+
+func TestConcurrentConfirmStartActivatesTask(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMemoryStore(time.Now, nil)
+	hasher := auth.NewPasswordHasher()
+	sessions := auth.NewSessionManager(time.Hour)
+	setupServices := service.NewServices(mem, hasher, sessions, nil, 10)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+
+	post, err := setupServices.Post.Create(ctx, alice, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "并发确认开始", Content: "双方同时确认后应立即开始", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := setupServices.Match.Accept(ctx, alice, app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coordinated := newSynchronizedTaskStore(mem)
+	concurrentServices := service.NewServices(coordinated, hasher, sessions, nil, 10)
+	results := make(chan error, 2)
+	go func() {
+		_, err := concurrentServices.Task.ConfirmStart(ctx, alice, task.ID)
+		results <- err
+	}()
+	go func() {
+		_, err := concurrentServices.Task.ConfirmStart(ctx, bob, task.ID)
+		results <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("confirm start failed: %v", err)
+		}
+	}
+
+	stored, err := mem.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.TaskInProgress || !stored.RequesterStarted || !stored.HelperStarted {
+		t.Fatalf("both confirmations succeeded but task was not activated: status=%s requester_started=%t helper_started=%t", stored.Status, stored.RequesterStarted, stored.HelperStarted)
 	}
 }
