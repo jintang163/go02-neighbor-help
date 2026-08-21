@@ -134,9 +134,10 @@ func (p *PostService) Cancel(ctx context.Context, actor model.User, id string, r
 	if post.Status == model.PostInProgress || post.Status == model.PostPendingConfirm || post.Status == model.PostMatched {
 		return model.HelpPost{}, model.ErrConflict
 	}
-	// 先改帖子为 cancelled 并落库，再作废其下待处理报名。报名状态持久化失败时按原值
-	// 回退帖子，使帖子和报名保持一致且可安全重试；否则帖子已变 cancelled 终态而报名仍
-	// pending，再次取消会被上面的终态校验拒绝，双方状态分裂且死锁。
+	// 先改帖子为 cancelled 并落库，再作废其下待处理报名。任一报名状态持久化失败时，
+	// 必须把已落库为 rejected 的报名连同帖子一并按原值回滚，使帖子和报名保持一致且可
+	// 安全重试；否则帖子虽回滚为 open，但先处理的报名仍停留在 rejected，同一帖子下
+	// 部分报名 pending、部分 rejected，状态分裂且无法重试。
 	prevStatus := post.Status
 	prevReason := post.ClosedReason
 	post.Status = model.PostCancelled
@@ -145,7 +146,12 @@ func (p *PostService) Cancel(ctx context.Context, actor model.User, id string, r
 	if err != nil {
 		return model.HelpPost{}, err
 	}
+	var rejected []model.Application
 	rollback := func() {
+		for i := range rejected {
+			rejected[i].Status = model.AppPending
+			_, _ = p.store.UpdateApplication(ctx, rejected[i])
+		}
 		post.Status = prevStatus
 		post.ClosedReason = prevReason
 		_, _ = p.store.UpdatePost(ctx, post)
@@ -164,6 +170,7 @@ func (p *PostService) Cancel(ctx context.Context, actor model.User, id string, r
 			rollback()
 			return model.HelpPost{}, err
 		}
+		rejected = append(rejected, a)
 		p.notify.Push(ctx, a.ApplicantID, model.NotifyRejected, "报名已失效", "作者取消了互助帖："+post.Title, post.ID, "post")
 	}
 	return updated, nil
@@ -221,9 +228,10 @@ func (p *PostService) ForceClose(ctx context.Context, actor model.User, id, reas
 	if err != nil {
 		return model.HelpPost{}, err
 	}
-	// 先改帖子为 closed 并落库，再作废其下待处理报名。报名状态持久化失败时按原值
-	// 回退帖子，使帖子和报名保持一致且可安全重试；否则帖子已变 closed 终态而报名仍
-	// pending，申请人仍可撤回这条报名，导致关闭后的关联流程仍可操作。
+	// 先改帖子为 closed 并落库，再作废其下待处理报名。任一报名状态持久化失败时，
+	// 必须把已落库为 rejected 的报名连同帖子一并按原值回滚，使帖子和报名保持一致且
+	// 可安全重试；否则帖子虽回滚为原状态，但先处理的报名仍停留在 rejected，申请人
+	// 仍可撤回这条报名，导致关闭后的关联流程仍可操作。
 	prevStatus := post.Status
 	prevReason := post.ClosedReason
 	post.Status = model.PostClosed
@@ -232,7 +240,12 @@ func (p *PostService) ForceClose(ctx context.Context, actor model.User, id, reas
 	if err != nil {
 		return model.HelpPost{}, err
 	}
+	var rejected []model.Application
 	rollback := func() {
+		for i := range rejected {
+			rejected[i].Status = model.AppPending
+			_, _ = p.store.UpdateApplication(ctx, rejected[i])
+		}
 		post.Status = prevStatus
 		post.ClosedReason = prevReason
 		_, _ = p.store.UpdatePost(ctx, post)
@@ -251,6 +264,7 @@ func (p *PostService) ForceClose(ctx context.Context, actor model.User, id, reas
 			rollback()
 			return model.HelpPost{}, err
 		}
+		rejected = append(rejected, a)
 		p.notify.Push(ctx, a.ApplicantID, model.NotifyRejected, "报名已失效", "管理员关闭了互助帖："+post.Title, post.ID, "post")
 	}
 	p.notify.Push(ctx, post.AuthorID, model.NotifySystem, "帖子已被管理员关闭", reason, post.ID, "post")
