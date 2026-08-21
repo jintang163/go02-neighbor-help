@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,25 @@ type synchronizedTaskStore struct {
 	mu      sync.Mutex
 	entered int
 	allIn   chan struct{}
+}
+
+var errRequesterCreditWrite = errors.New("credit store write failed for requester: durable log unavailable")
+
+type failSecondCreditStore struct {
+	store.Store
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *failSecondCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 2 {
+		return model.User{}, model.CreditLog{}, errRequesterCreditWrite
+	}
+	return s.Store.ApplyCredit(ctx, userID, delta, reason, relatedID, note)
 }
 
 func newSynchronizedTaskStore(base store.Store) *synchronizedTaskStore {
@@ -269,5 +289,70 @@ func TestConcurrentConfirmStartActivatesTask(t *testing.T) {
 	}
 	if stored.Status != model.TaskInProgress || !stored.RequesterStarted || !stored.HelperStarted {
 		t.Fatalf("both confirmations succeeded but task was not activated: status=%s requester_started=%t helper_started=%t", stored.Status, stored.RequesterStarted, stored.HelperStarted)
+	}
+}
+
+func TestConfirmCompleteFailureKeepsWorkflowRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+	post, err := setupServices.Post.Create(ctx, alice, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "确认完成失败恢复", Content: "信用记录失败后仍应可以重试", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := setupServices.Match.Accept(ctx, alice, app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupServices.Task.ConfirmStart(ctx, alice, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupServices.Task.ConfirmStart(ctx, bob, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupServices.Task.MarkComplete(ctx, bob, task.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	aliceBefore, err := mem.GetUserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobBefore, err := mem.GetUserByID(ctx, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing := &failSecondCreditStore{Store: mem}
+	failingServices := service.NewServices(failing, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, completionErr := failingServices.Task.ConfirmComplete(ctx, alice, task.ID)
+	if !errors.Is(completionErr, errRequesterCreditWrite) {
+		t.Fatalf("want requester credit failure %q, got %v", errRequesterCreditWrite, completionErr)
+	}
+
+	storedTask, err := mem.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedPost, err := mem.GetPost(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceAfter, err := mem.GetUserByID(ctx, alice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobAfter, err := mem.GetUserByID(ctx, bob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedTask.Status != model.TaskPendingConfirm || storedPost.Status != model.PostPendingConfirm || aliceAfter.CreditScore != aliceBefore.CreditScore || bobAfter.CreditScore != bobBefore.CreditScore {
+		t.Fatalf("failed completion left partial state: task=%s post=%s requester_credit=%d->%d helper_credit=%d->%d error=%v", storedTask.Status, storedPost.Status, aliceBefore.CreditScore, aliceAfter.CreditScore, bobBefore.CreditScore, bobAfter.CreditScore, completionErr)
 	}
 }
