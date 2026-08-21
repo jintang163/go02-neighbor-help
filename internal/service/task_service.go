@@ -82,6 +82,10 @@ func (t *TaskService) MarkComplete(ctx context.Context, actor model.User, id str
 		return model.TaskView{}, err
 	}
 	if err := t.syncPostStatus(ctx, updated, model.PostPendingConfirm); err != nil {
+		// 帖子状态持久化失败：把任务回退回 in_progress，使任务与帖子保持一致且可重试。
+		// 否则任务停留在 pending_confirm 而帖子仍是 in_progress，再次标记会被状态校验拒绝，死锁。
+		task.Status = model.TaskInProgress
+		_, _ = t.store.UpdateTask(ctx, task)
 		return model.TaskView{}, err
 	}
 	t.notify.Push(ctx, task.RequesterID, model.NotifyTaskCompleted, "帮助方已标记完成", "请确认本次互助是否完成。", task.ID, "task")
