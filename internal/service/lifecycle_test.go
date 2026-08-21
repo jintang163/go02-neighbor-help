@@ -631,3 +631,36 @@ func TestPostCancelFailureKeepsApplicationsAndPostRetryable(t *testing.T) {
 		t.Fatalf("retry cancellation should succeed after storage recovers: %v", err)
 	}
 }
+
+func TestForceCloseInvalidatesPendingApplications(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	author := mustUser(t, ctx, setupServices, "forceauthor")
+	applicant := mustUser(t, ctx, setupServices, "forceapplicant")
+	admin, err := mem.CreateUser(ctx, model.User{Username: "forceadmin", DisplayName: "管理员", Role: model.RoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := setupServices.Post.Create(ctx, author, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "管理员关闭帖子", Content: "关闭后报名不能继续待处理", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := setupServices.Match.Apply(ctx, applicant, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closed, err := setupServices.Post.ForceClose(ctx, admin, post.ID, "内容违规")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedApplication, _ := mem.GetApplication(ctx, application.ID)
+	if closed.Status != model.PostClosed || storedApplication.Status == model.AppPending {
+		t.Fatalf("force close left an actionable application: post=%s application=%s", closed.Status, storedApplication.Status)
+	}
+	if _, err := setupServices.Match.Withdraw(ctx, applicant, application.ID); !errors.Is(err, model.ErrConflict) {
+		t.Fatalf("application should already be terminal after force close, withdraw error=%v", err)
+	}
+}
