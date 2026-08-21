@@ -184,9 +184,19 @@ func (t *TaskService) Cancel(ctx context.Context, actor model.User, id string, i
 		return model.TaskView{}, model.ErrInvalidTaskStatus
 	}
 	afterStart := task.Status == model.TaskInProgress || task.Status == model.TaskPendingConfirm || task.Status == model.TaskDisputed
-	// 先改任务为 cancelled 并落库，再同步帖子终态。帖子状态持久化失败时按原值回退任务，
-	// 使任务与帖子保持一致且可安全重试；否则任务已变 cancelled 终态而帖子仍是进行中，
-	// 再次取消会被上面的终态校验拒绝，双方状态分裂且死锁。
+	deduct := afterStart && !actor.IsAdmin()
+	// 先写入开始后取消的信用处罚（最易失败的一步），成功后再提交任务/帖子终态。
+	// 任一步后续失败时按反序冲销已落账的信用分，使任务维持原状态且可安全重试；
+	// 否则任务/帖子已变 cancelled 终态而信用分未扣，再次取消会被上面的终态校验
+	// 拒绝，处罚永远无法补记。
+	undoDeduct := func() {
+		_, _ = t.credit.Apply(ctx, actor.ID, 3, model.CreditCancelAfterStart, task.ID, "开始后取消（回滚）")
+	}
+	if deduct {
+		if _, err := t.credit.Apply(ctx, actor.ID, -3, model.CreditCancelAfterStart, task.ID, "开始后取消"); err != nil {
+			return model.TaskView{}, err
+		}
+	}
 	prevStatus := task.Status
 	prevReason := task.CancelReason
 	prevCancelledBy := task.CancelledBy
@@ -195,17 +205,20 @@ func (t *TaskService) Cancel(ctx context.Context, actor model.User, id string, i
 	task.CancelledBy = actor.ID
 	updated, err := t.store.UpdateTask(ctx, task)
 	if err != nil {
+		if deduct {
+			undoDeduct()
+		}
 		return model.TaskView{}, err
 	}
 	if err := t.syncPostStatus(ctx, updated, model.PostCancelled); err != nil {
+		if deduct {
+			undoDeduct()
+		}
 		task.Status = prevStatus
 		task.CancelReason = prevReason
 		task.CancelledBy = prevCancelledBy
 		_, _ = t.store.UpdateTask(ctx, task)
 		return model.TaskView{}, err
-	}
-	if afterStart && !actor.IsAdmin() {
-		_, _ = t.credit.Apply(ctx, actor.ID, -3, model.CreditCancelAfterStart, task.ID, "开始后取消")
 	}
 	other := task.Counterpart(actor.ID)
 	t.notify.Push(ctx, other, model.NotifyTaskCancelled, "互助已取消", in.Reason, task.ID, "task")
