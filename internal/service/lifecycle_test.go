@@ -26,12 +26,19 @@ var (
 	errPostStatusWrite      = errors.New("post store write failed during mark complete: disk sync unavailable")
 	errReviewCreditWrite    = errors.New("credit store write failed for reviewed user: ledger unavailable")
 	errReportCreditWrite    = errors.New("credit store write failed for reported user: penalty ledger unavailable")
+	errCancelPostWrite      = errors.New("post store write failed during task cancellation: storage unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
 
 func (s *failPostUpdateStore) UpdatePost(ctx context.Context, post model.HelpPost) (model.HelpPost, error) {
 	return model.HelpPost{}, errPostStatusWrite
+}
+
+type failCancelPostStore struct{ store.Store }
+
+func (s *failCancelPostStore) UpdatePost(ctx context.Context, post model.HelpPost) (model.HelpPost, error) {
+	return model.HelpPost{}, errCancelPostWrite
 }
 
 type failReviewCreditStore struct{ store.Store }
@@ -562,5 +569,27 @@ func TestAcceptedReportFailureKeepsModerationRetryable(t *testing.T) {
 	_, sessionErr := sessions.Get(token)
 	if storedReport.Status != model.ReportPending || storedTarget.Status != model.UserActive || sessionErr != nil {
 		t.Fatalf("failed report handling left partial moderation: report=%s target_status=%s session_error=%v operation_error=%v", storedReport.Status, storedTarget.Status, sessionErr, handleErr)
+	}
+}
+
+func TestCancelFailureKeepsWorkflowRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+	post, _ := setupServices.Post.Create(ctx, alice, model.PostInput{Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal, Title: "取消失败恢复", Content: "帖子写失败后仍应重试", Publish: true})
+	app, _ := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	task, _ := setupServices.Match.Accept(ctx, alice, app.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, alice, task.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, bob, task.ID)
+
+	failingServices := service.NewServices(&failCancelPostStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, cancelErr := failingServices.Task.Cancel(ctx, bob, task.ID, model.CancelInput{Reason: "临时无法继续"})
+	if !errors.Is(cancelErr, errCancelPostWrite) {
+		t.Fatalf("want cancel post failure %q, got %v", errCancelPostWrite, cancelErr)
+	}
+	storedTask, _ := mem.GetTask(ctx, task.ID)
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress {
+		t.Fatalf("failed cancellation left split workflow: task=%s post=%s operation_error=%v", storedTask.Status, storedPost.Status, cancelErr)
 	}
 }
