@@ -27,6 +27,7 @@ var (
 	errReviewCreditWrite    = errors.New("credit store write failed for reviewed user: ledger unavailable")
 	errReportCreditWrite    = errors.New("credit store write failed for reported user: penalty ledger unavailable")
 	errCancelPostWrite      = errors.New("post store write failed during task cancellation: storage unavailable")
+	errCancelAppWrite       = errors.New("application store write failed during post cancellation: storage unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
@@ -39,6 +40,12 @@ type failCancelPostStore struct{ store.Store }
 
 func (s *failCancelPostStore) UpdatePost(ctx context.Context, post model.HelpPost) (model.HelpPost, error) {
 	return model.HelpPost{}, errCancelPostWrite
+}
+
+type failCancelApplicationStore struct{ store.Store }
+
+func (s *failCancelApplicationStore) UpdateApplication(ctx context.Context, app model.Application) (model.Application, error) {
+	return model.Application{}, errCancelAppWrite
 }
 
 type failReviewCreditStore struct{ store.Store }
@@ -591,5 +598,36 @@ func TestCancelFailureKeepsWorkflowRetryable(t *testing.T) {
 	storedPost, _ := mem.GetPost(ctx, post.ID)
 	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress {
 		t.Fatalf("failed cancellation left split workflow: task=%s post=%s operation_error=%v", storedTask.Status, storedPost.Status, cancelErr)
+	}
+}
+
+func TestPostCancelFailureKeepsApplicationsAndPostRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	author := mustUser(t, ctx, setupServices, "cancelauthor")
+	applicant := mustUser(t, ctx, setupServices, "cancelapplicant")
+	post, err := setupServices.Post.Create(ctx, author, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "帖子取消失败恢复", Content: "报名写失败后应保持可重试", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := setupServices.Match.Apply(ctx, applicant, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failingServices := service.NewServices(&failCancelApplicationStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, cancelErr := failingServices.Post.Cancel(ctx, author, post.ID, "暂时无法提供帮助")
+	if !errors.Is(cancelErr, errCancelAppWrite) {
+		t.Fatalf("want application cancellation failure %q, got %v", errCancelAppWrite, cancelErr)
+	}
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	storedApplication, _ := mem.GetApplication(ctx, application.ID)
+	if storedPost.Status != model.PostOpen || storedApplication.Status != model.AppPending {
+		t.Fatalf("failed post cancellation left partial state: post=%s application=%s operation_error=%v", storedPost.Status, storedApplication.Status, cancelErr)
+	}
+	if _, err := setupServices.Post.Cancel(ctx, author, post.ID, "暂时无法提供帮助"); err != nil {
+		t.Fatalf("retry cancellation should succeed after storage recovers: %v", err)
 	}
 }
