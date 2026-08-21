@@ -102,20 +102,38 @@ func (t *TaskService) ConfirmComplete(ctx context.Context, actor model.User, id 
 	if task.Status != model.TaskPendingConfirm {
 		return model.TaskView{}, model.ErrInvalidTaskStatus
 	}
+
+	// 先写入两笔信用分（最易失败的一步），都成功后再提交任务/帖子终态。
+	// 任一步失败时按反序冲销已落账的信用分，使任务维持 pending_confirm，保证可安全重试。
+	undoHelper := func() {
+		_, _ = t.credit.Apply(ctx, task.HelperID, -2, model.CreditCompleteHelper, task.ID, "完成帮助（回滚）")
+	}
+	undoBoth := func() {
+		_, _ = t.credit.Apply(ctx, task.RequesterID, -1, model.CreditCompleteRequester, task.ID, "完成求助（回滚）")
+		undoHelper()
+	}
+
+	if _, err := t.credit.Apply(ctx, task.HelperID, 2, model.CreditCompleteHelper, task.ID, "完成帮助"); err != nil {
+		return model.TaskView{}, err
+	}
+	if _, err := t.credit.Apply(ctx, task.RequesterID, 1, model.CreditCompleteRequester, task.ID, "完成求助"); err != nil {
+		undoHelper()
+		return model.TaskView{}, err
+	}
+
 	now := t.clock.Now()
 	task.Status = model.TaskCompleted
 	task.CompleteAt = &now
 	updated, err := t.store.UpdateTask(ctx, task)
 	if err != nil {
+		undoBoth()
 		return model.TaskView{}, err
 	}
 	if err := t.syncPostStatus(ctx, updated, model.PostCompleted); err != nil {
-		return model.TaskView{}, err
-	}
-	if _, err := t.credit.Apply(ctx, task.HelperID, 2, model.CreditCompleteHelper, task.ID, "完成帮助"); err != nil {
-		return model.TaskView{}, err
-	}
-	if _, err := t.credit.Apply(ctx, task.RequesterID, 1, model.CreditCompleteRequester, task.ID, "完成求助"); err != nil {
+		undoBoth()
+		task.Status = model.TaskPendingConfirm
+		task.CompleteAt = nil
+		_, _ = t.store.UpdateTask(ctx, task)
 		return model.TaskView{}, err
 	}
 	t.bumpCounts(ctx, task)

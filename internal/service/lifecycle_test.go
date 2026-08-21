@@ -20,7 +20,29 @@ type synchronizedTaskStore struct {
 	allIn   chan struct{}
 }
 
-var errRequesterCreditWrite = errors.New("credit store write failed for requester: durable log unavailable")
+var (
+	errRequesterCreditWrite = errors.New("credit store write failed for requester: durable log unavailable")
+	errHelperCreditWrite    = errors.New("credit store write failed for helper: durable log unavailable")
+)
+
+// failFirstCreditStore 让 ApplyCredit 第一次调用即失败，用于验证帮助方信用写入
+// 失败时不会留下任何部分提交（此时尚未推进任务/帖子终态，也无需冲销）。
+type failFirstCreditStore struct {
+	store.Store
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *failFirstCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		return model.User{}, model.CreditLog{}, errHelperCreditWrite
+	}
+	return s.Store.ApplyCredit(ctx, userID, delta, reason, relatedID, note)
+}
 
 type failSecondCreditStore struct {
 	store.Store
@@ -354,5 +376,65 @@ func TestConfirmCompleteFailureKeepsWorkflowRetryable(t *testing.T) {
 	}
 	if storedTask.Status != model.TaskPendingConfirm || storedPost.Status != model.PostPendingConfirm || aliceAfter.CreditScore != aliceBefore.CreditScore || bobAfter.CreditScore != bobBefore.CreditScore {
 		t.Fatalf("failed completion left partial state: task=%s post=%s requester_credit=%d->%d helper_credit=%d->%d error=%v", storedTask.Status, storedPost.Status, aliceBefore.CreditScore, aliceAfter.CreditScore, bobBefore.CreditScore, bobAfter.CreditScore, completionErr)
+	}
+
+	// 失败后用正常 store 重试，应能顺利完成：任务/帖子变 completed，双方信用分各加一次。
+	retry, err := setupServices.Task.ConfirmComplete(ctx, alice, task.ID)
+	if err != nil {
+		t.Fatalf("retry confirm complete failed: %v", err)
+	}
+	if retry.Status != model.TaskCompleted {
+		t.Fatalf("retry want completed, got %s", retry.Status)
+	}
+	bobFinal, _ := setupServices.User.GetByID(ctx, bob.ID)
+	aliceFinal, _ := setupServices.User.GetByID(ctx, alice.ID)
+	if bobFinal.CreditScore != bobBefore.CreditScore+2 {
+		t.Fatalf("retry helper credit want %d, got %d", bobBefore.CreditScore+2, bobFinal.CreditScore)
+	}
+	if aliceFinal.CreditScore != aliceBefore.CreditScore+1 {
+		t.Fatalf("retry requester credit want %d, got %d", aliceBefore.CreditScore+1, aliceFinal.CreditScore)
+	}
+}
+
+func TestConfirmCompleteHelperCreditFailureKeepsWorkflowRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+	post, err := setupServices.Post.Create(ctx, alice, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "帮助方信用失败恢复", Content: "帮助方信用记录失败后仍应可以重试", Publish: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := setupServices.Match.Accept(ctx, alice, app.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = setupServices.Task.ConfirmStart(ctx, alice, task.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, bob, task.ID)
+	_, _ = setupServices.Task.MarkComplete(ctx, bob, task.ID)
+
+	aliceBefore, _ := mem.GetUserByID(ctx, alice.ID)
+	bobBefore, _ := mem.GetUserByID(ctx, bob.ID)
+
+	// 第一次 ApplyCredit 即失败：帮助方信用尚未落账，不应有部分提交，也无需冲销。
+	failing := &failFirstCreditStore{Store: mem}
+	failingServices := service.NewServices(failing, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, completionErr := failingServices.Task.ConfirmComplete(ctx, alice, task.ID)
+	if !errors.Is(completionErr, errHelperCreditWrite) {
+		t.Fatalf("want helper credit failure %q, got %v", errHelperCreditWrite, completionErr)
+	}
+
+	storedTask, _ := mem.GetTask(ctx, task.ID)
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	aliceAfter, _ := mem.GetUserByID(ctx, alice.ID)
+	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
+	if storedTask.Status != model.TaskPendingConfirm || storedPost.Status != model.PostPendingConfirm || aliceAfter.CreditScore != aliceBefore.CreditScore || bobAfter.CreditScore != bobBefore.CreditScore {
+		t.Fatalf("helper-credit failure left partial state: task=%s post=%s requester_credit=%d->%d helper_credit=%d->%d error=%v", storedTask.Status, storedPost.Status, aliceBefore.CreditScore, aliceAfter.CreditScore, bobBefore.CreditScore, bobAfter.CreditScore, completionErr)
 	}
 }
