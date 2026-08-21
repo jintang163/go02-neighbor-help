@@ -184,6 +184,12 @@ func (t *TaskService) Cancel(ctx context.Context, actor model.User, id string, i
 		return model.TaskView{}, model.ErrInvalidTaskStatus
 	}
 	afterStart := task.Status == model.TaskInProgress || task.Status == model.TaskPendingConfirm || task.Status == model.TaskDisputed
+	// 先改任务为 cancelled 并落库，再同步帖子终态。帖子状态持久化失败时按原值回退任务，
+	// 使任务与帖子保持一致且可安全重试；否则任务已变 cancelled 终态而帖子仍是进行中，
+	// 再次取消会被上面的终态校验拒绝，双方状态分裂且死锁。
+	prevStatus := task.Status
+	prevReason := task.CancelReason
+	prevCancelledBy := task.CancelledBy
 	task.Status = model.TaskCancelled
 	task.CancelReason = in.Reason
 	task.CancelledBy = actor.ID
@@ -192,6 +198,10 @@ func (t *TaskService) Cancel(ctx context.Context, actor model.User, id string, i
 		return model.TaskView{}, err
 	}
 	if err := t.syncPostStatus(ctx, updated, model.PostCancelled); err != nil {
+		task.Status = prevStatus
+		task.CancelReason = prevReason
+		task.CancelledBy = prevCancelledBy
+		_, _ = t.store.UpdateTask(ctx, task)
 		return model.TaskView{}, err
 	}
 	if afterStart && !actor.IsAdmin() {
