@@ -25,6 +25,7 @@ var (
 	errHelperCreditWrite    = errors.New("credit store write failed for helper: durable log unavailable")
 	errPostStatusWrite      = errors.New("post store write failed during mark complete: disk sync unavailable")
 	errReviewCreditWrite    = errors.New("credit store write failed for reviewed user: ledger unavailable")
+	errReportCreditWrite    = errors.New("credit store write failed for reported user: penalty ledger unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
@@ -37,6 +38,12 @@ type failReviewCreditStore struct{ store.Store }
 
 func (s *failReviewCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
 	return model.User{}, model.CreditLog{}, errReviewCreditWrite
+}
+
+type failReportCreditStore struct{ store.Store }
+
+func (s *failReportCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	return model.User{}, model.CreditLog{}, errReportCreditWrite
 }
 
 // failFirstCreditStore 让 ApplyCredit 第一次调用即失败，用于验证帮助方信用写入
@@ -522,5 +529,38 @@ func TestReviewFailureKeepsSubmissionRetryable(t *testing.T) {
 	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
 	if !model.IsNotFound(reviewErr) || bobAfter.CreditScore != bobBefore.CreditScore {
 		t.Fatalf("failed review left partial submission: review_id=%s lookup_error=%v recipient_credit=%d->%d operation_error=%v", storedReview.ID, reviewErr, bobBefore.CreditScore, bobAfter.CreditScore, submitErr)
+	}
+}
+
+func TestAcceptedReportFailureKeepsModerationRetryable(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMemoryStore(time.Now, nil)
+	sessions := auth.NewSessionManager(time.Hour)
+	setupServices := service.NewServices(mem, auth.NewPasswordHasher(), sessions, nil, 10)
+	reporter := mustUser(t, ctx, setupServices, "reporter")
+	target := mustUser(t, ctx, setupServices, "target")
+	admin, err := mem.CreateUser(ctx, model.User{Username: "admin2", DisplayName: "管理员", Role: model.RoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := sessions.Create(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := setupServices.Report.Create(ctx, reporter, model.ReportInput{TargetType: model.ReportUser, TargetID: target.ID, Reason: "恶意骚扰"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failingServices := service.NewServices(&failReportCreditStore{Store: mem}, auth.NewPasswordHasher(), sessions, nil, 10)
+	_, handleErr := failingServices.Report.Handle(ctx, admin, report.ID, model.HandleReportInput{Action: "accept", Freeze: true, Note: "核实成立"})
+	if !errors.Is(handleErr, errReportCreditWrite) {
+		t.Fatalf("want report credit failure %q, got %v", errReportCreditWrite, handleErr)
+	}
+	storedReport, _ := mem.GetReport(ctx, report.ID)
+	storedTarget, _ := mem.GetUserByID(ctx, target.ID)
+	_, sessionErr := sessions.Get(token)
+	if storedReport.Status != model.ReportPending || storedTarget.Status != model.UserActive || sessionErr != nil {
+		t.Fatalf("failed report handling left partial moderation: report=%s target_status=%s session_error=%v operation_error=%v", storedReport.Status, storedTarget.Status, sessionErr, handleErr)
 	}
 }
