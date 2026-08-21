@@ -146,15 +146,23 @@ func (r *ReportService) applyAccept(ctx context.Context, _ model.User, rep model
 		if err != nil {
 			return err
 		}
+		// 信用账本写入是举报成立流程中最易失败的一步，先做：失败时帖子尚未关闭，
+		// 举报维持 pending，可安全重试。成功后再关闭帖子；若关闭失败则冲销已扣减的
+		// 信用分，使举报与帖子保持原状态且可重试，避免帖子已提前关闭而信用未扣
+		// 造成的状态不一致。
+		if _, err := r.credit.Apply(ctx, post.AuthorID, -10, model.CreditReportAccepted, rep.ID, "帖子举报成立"); err != nil {
+			return err
+		}
 		if !post.Status.IsTerminal() {
 			post.Status = model.PostClosed
 			post.ClosedReason = "report accepted"
 			if _, err := r.store.UpdatePost(ctx, post); err != nil {
+				// 帖子关闭失败：冲销已扣减的信用分，使举报维持 pending 且帖子保持原状态，可安全重试。
+				_, _ = r.credit.Apply(ctx, post.AuthorID, 10, model.CreditReportAccepted, rep.ID, "帖子举报成立（回滚）")
 				return err
 			}
 		}
-		_, err = r.credit.Apply(ctx, post.AuthorID, -10, model.CreditReportAccepted, rep.ID, "帖子举报成立")
-		return err
+		return nil
 	case model.ReportMessage:
 		return r.store.DeleteMessage(ctx, rep.TargetID)
 	case model.ReportReview:
