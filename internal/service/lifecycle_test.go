@@ -28,6 +28,7 @@ var (
 	errReportCreditWrite    = errors.New("credit store write failed for reported user: penalty ledger unavailable")
 	errCancelPostWrite      = errors.New("post store write failed during task cancellation: storage unavailable")
 	errCancelAppWrite       = errors.New("application store write failed during post cancellation: storage unavailable")
+	errCancelCreditWrite    = errors.New("credit store write failed during task cancellation: ledger unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
@@ -46,6 +47,12 @@ type failCancelApplicationStore struct{ store.Store }
 
 func (s *failCancelApplicationStore) UpdateApplication(ctx context.Context, app model.Application) (model.Application, error) {
 	return model.Application{}, errCancelAppWrite
+}
+
+type failCancelCreditStore struct{ store.Store }
+
+func (s *failCancelCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	return model.User{}, model.CreditLog{}, errCancelCreditWrite
 }
 
 type failReviewCreditStore struct{ store.Store }
@@ -662,5 +669,29 @@ func TestForceCloseInvalidatesPendingApplications(t *testing.T) {
 	}
 	if _, err := setupServices.Match.Withdraw(ctx, applicant, application.ID); !errors.Is(err, model.ErrConflict) {
 		t.Fatalf("application should already be terminal after force close, withdraw error=%v", err)
+	}
+}
+
+func TestTaskCancelCreditFailureKeepsWorkflowRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "cancelcreditowner")
+	bob := mustUser(t, ctx, setupServices, "cancelcredithelper")
+	post, _ := setupServices.Post.Create(ctx, alice, model.PostInput{Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal, Title: "取消信用失败", Content: "信用账本失败后应保持可重试", Publish: true})
+	app, _ := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	task, _ := setupServices.Match.Accept(ctx, alice, app.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, alice, task.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, bob, task.ID)
+	bobBefore, _ := mem.GetUserByID(ctx, bob.ID)
+
+	failingServices := service.NewServices(&failCancelCreditStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, cancelErr := failingServices.Task.Cancel(ctx, bob, task.ID, model.CancelInput{Reason: "临时无法继续"})
+	if !errors.Is(cancelErr, errCancelCreditWrite) {
+		t.Fatalf("want cancellation credit failure %q, got %v", errCancelCreditWrite, cancelErr)
+	}
+	storedTask, _ := mem.GetTask(ctx, task.ID)
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
+	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress || bobAfter.CreditScore != bobBefore.CreditScore {
+		t.Fatalf("failed cancellation left partial workflow: task=%s post=%s credit=%d->%d operation_error=%v", storedTask.Status, storedPost.Status, bobBefore.CreditScore, bobAfter.CreditScore, cancelErr)
 	}
 }
