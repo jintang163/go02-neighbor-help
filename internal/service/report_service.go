@@ -123,15 +123,24 @@ func (r *ReportService) applyAccept(ctx context.Context, _ model.User, rep model
 		if err != nil {
 			return err
 		}
+		// 信用账本写入是举报成立流程中最易失败的一步，先做：失败时尚未冻结用户、
+		// 未清除登录会话，举报维持 pending，可安全重试。返回的 u 携带最新信用分，
+		// 后续冻结据此回写，避免用过期副本覆盖刚落账的信用分。
+		updated, err := r.credit.Apply(ctx, u.ID, -10, model.CreditReportAccepted, rep.ID, "举报成立")
+		if err != nil {
+			return err
+		}
+		u = updated
 		if freeze && !u.IsAdmin() {
 			u.Status = model.UserFrozen
 			if _, err := r.store.UpdateUser(ctx, u); err != nil {
+				// 冻结失败：冲销已扣减的信用分，使举报、用户与会话保持一致且可重试。
+				_, _ = r.credit.Apply(ctx, u.ID, 10, model.CreditReportAccepted, rep.ID, "举报成立（回滚）")
 				return err
 			}
 			r.sessions.InvalidateByUser(u.ID)
 		}
-		_, err = r.credit.Apply(ctx, u.ID, -10, model.CreditReportAccepted, rep.ID, "举报成立")
-		return err
+		return nil
 	case model.ReportPost:
 		post, err := r.store.GetPost(ctx, rep.TargetID)
 		if err != nil {
