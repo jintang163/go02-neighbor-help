@@ -24,12 +24,19 @@ var (
 	errRequesterCreditWrite = errors.New("credit store write failed for requester: durable log unavailable")
 	errHelperCreditWrite    = errors.New("credit store write failed for helper: durable log unavailable")
 	errPostStatusWrite      = errors.New("post store write failed during mark complete: disk sync unavailable")
+	errReviewCreditWrite    = errors.New("credit store write failed for reviewed user: ledger unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
 
 func (s *failPostUpdateStore) UpdatePost(ctx context.Context, post model.HelpPost) (model.HelpPost, error) {
 	return model.HelpPost{}, errPostStatusWrite
+}
+
+type failReviewCreditStore struct{ store.Store }
+
+func (s *failReviewCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	return model.User{}, model.CreditLog{}, errReviewCreditWrite
 }
 
 // failFirstCreditStore 让 ApplyCredit 第一次调用即失败，用于验证帮助方信用写入
@@ -487,5 +494,33 @@ func TestMarkCompleteFailureKeepsTaskRetryable(t *testing.T) {
 	}
 	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress {
 		t.Fatalf("failed mark complete left workflow inconsistent: task=%s post=%s error=%v", storedTask.Status, storedPost.Status, markErr)
+	}
+}
+
+func TestReviewFailureKeepsSubmissionRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	alice := mustUser(t, ctx, setupServices, "alice")
+	bob := mustUser(t, ctx, setupServices, "bob")
+	post, _ := setupServices.Post.Create(ctx, alice, model.PostInput{
+		Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal,
+		Title: "评价失败恢复", Content: "信用账本失败后评价仍应可以重试", Publish: true,
+	})
+	app, _ := setupServices.Match.Apply(ctx, bob, post.ID, model.ApplyInput{})
+	task, _ := setupServices.Match.Accept(ctx, alice, app.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, alice, task.ID)
+	_, _ = setupServices.Task.ConfirmStart(ctx, bob, task.ID)
+	_, _ = setupServices.Task.MarkComplete(ctx, bob, task.ID)
+	_, _ = setupServices.Task.ConfirmComplete(ctx, alice, task.ID)
+	bobBefore, _ := mem.GetUserByID(ctx, bob.ID)
+
+	failingServices := service.NewServices(&failReviewCreditStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, submitErr := failingServices.Review.Submit(ctx, alice, task.ID, model.ReviewInput{Score: 5, Tags: []string{"kind"}, Comment: "很热心"})
+	if !errors.Is(submitErr, errReviewCreditWrite) {
+		t.Fatalf("want review credit failure %q, got %v", errReviewCreditWrite, submitErr)
+	}
+	storedReview, reviewErr := mem.GetReviewByTaskFrom(ctx, task.ID, alice.ID)
+	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
+	if !model.IsNotFound(reviewErr) || bobAfter.CreditScore != bobBefore.CreditScore {
+		t.Fatalf("failed review left partial submission: review_id=%s lookup_error=%v recipient_credit=%d->%d operation_error=%v", storedReview.ID, reviewErr, bobBefore.CreditScore, bobAfter.CreditScore, submitErr)
 	}
 }
