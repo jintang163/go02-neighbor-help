@@ -29,6 +29,7 @@ var (
 	errCancelPostWrite      = errors.New("post store write failed during task cancellation: storage unavailable")
 	errCancelAppWrite       = errors.New("application store write failed during post cancellation: storage unavailable")
 	errCancelCreditWrite    = errors.New("credit store write failed during task cancellation: ledger unavailable")
+	errSecondCancelAppWrite = errors.New("second application write failed during post cancellation: storage unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
@@ -53,6 +54,23 @@ type failCancelCreditStore struct{ store.Store }
 
 func (s *failCancelCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
 	return model.User{}, model.CreditLog{}, errCancelCreditWrite
+}
+
+type failSecondCancelApplicationStore struct {
+	store.Store
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *failSecondCancelApplicationStore) UpdateApplication(ctx context.Context, app model.Application) (model.Application, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 2 {
+		return model.Application{}, errSecondCancelAppWrite
+	}
+	return s.Store.UpdateApplication(ctx, app)
 }
 
 type failReviewCreditStore struct{ store.Store }
@@ -693,5 +711,27 @@ func TestTaskCancelCreditFailureKeepsWorkflowRetryable(t *testing.T) {
 	bobAfter, _ := mem.GetUserByID(ctx, bob.ID)
 	if storedTask.Status != model.TaskInProgress || storedPost.Status != model.PostInProgress || bobAfter.CreditScore != bobBefore.CreditScore {
 		t.Fatalf("failed cancellation left partial workflow: task=%s post=%s credit=%d->%d operation_error=%v", storedTask.Status, storedPost.Status, bobBefore.CreditScore, bobAfter.CreditScore, cancelErr)
+	}
+}
+
+func TestPostCancelSecondApplicationFailureRollsBackAllApplications(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	author := mustUser(t, ctx, setupServices, "multicancelauthor")
+	first := mustUser(t, ctx, setupServices, "multicancelfirst")
+	second := mustUser(t, ctx, setupServices, "multicancelsecond")
+	post, _ := setupServices.Post.Create(ctx, author, model.PostInput{Type: model.PostRequest, Category: model.CategoryDelivery, Urgency: model.UrgencyNormal, Title: "多报名取消回滚", Content: "任一报名失败都应整体回滚", Publish: true})
+	app1, _ := setupServices.Match.Apply(ctx, first, post.ID, model.ApplyInput{})
+	app2, _ := setupServices.Match.Apply(ctx, second, post.ID, model.ApplyInput{})
+
+	failingServices := service.NewServices(&failSecondCancelApplicationStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, cancelErr := failingServices.Post.Cancel(ctx, author, post.ID, "暂时停止")
+	if !errors.Is(cancelErr, errSecondCancelAppWrite) {
+		t.Fatalf("want second application failure %q, got %v", errSecondCancelAppWrite, cancelErr)
+	}
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	storedFirst, _ := mem.GetApplication(ctx, app1.ID)
+	storedSecond, _ := mem.GetApplication(ctx, app2.ID)
+	if storedPost.Status != model.PostOpen || storedFirst.Status != model.AppPending || storedSecond.Status != model.AppPending {
+		t.Fatalf("failed batch cancellation left partial state: post=%s first=%s second=%s error=%v", storedPost.Status, storedFirst.Status, storedSecond.Status, cancelErr)
 	}
 }
