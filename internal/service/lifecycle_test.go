@@ -30,6 +30,7 @@ var (
 	errCancelAppWrite       = errors.New("application store write failed during post cancellation: storage unavailable")
 	errCancelCreditWrite    = errors.New("credit store write failed during task cancellation: ledger unavailable")
 	errSecondCancelAppWrite = errors.New("second application write failed during post cancellation: storage unavailable")
+	errReportPostCreditWrite = errors.New("credit store write failed for reported post author: penalty ledger unavailable")
 )
 
 type failPostUpdateStore struct{ store.Store }
@@ -83,6 +84,12 @@ type failReportCreditStore struct{ store.Store }
 
 func (s *failReportCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
 	return model.User{}, model.CreditLog{}, errReportCreditWrite
+}
+
+type failReportPostCreditStore struct{ store.Store }
+
+func (s *failReportPostCreditStore) ApplyCredit(ctx context.Context, userID string, delta int, reason model.CreditReason, relatedID, note string) (model.User, model.CreditLog, error) {
+	return model.User{}, model.CreditLog{}, errReportPostCreditWrite
 }
 
 // failFirstCreditStore 让 ApplyCredit 第一次调用即失败，用于验证帮助方信用写入
@@ -733,5 +740,25 @@ func TestPostCancelSecondApplicationFailureRollsBackAllApplications(t *testing.T
 	storedSecond, _ := mem.GetApplication(ctx, app2.ID)
 	if storedPost.Status != model.PostOpen || storedFirst.Status != model.AppPending || storedSecond.Status != model.AppPending {
 		t.Fatalf("failed batch cancellation left partial state: post=%s first=%s second=%s error=%v", storedPost.Status, storedFirst.Status, storedSecond.Status, cancelErr)
+	}
+}
+
+func TestReportedPostCreditFailureKeepsModerationRetryable(t *testing.T) {
+	ctx, setupServices, mem := setup(t)
+	author := mustUser(t, ctx, setupServices, "reportedpostauthor")
+	reporter := mustUser(t, ctx, setupServices, "reportedpostreporter")
+	admin, _ := mem.CreateUser(ctx, model.User{Username: "reportedpostadmin", DisplayName: "管理员", Role: model.RoleAdmin})
+	post, _ := setupServices.Post.Create(ctx, author, model.PostInput{Type: model.PostOffer, Category: model.CategoryOther, Urgency: model.UrgencyNormal, Title: "被举报帖子", Content: "信用失败不应先关闭", Publish: true})
+	report, _ := setupServices.Report.Create(ctx, reporter, model.ReportInput{TargetType: model.ReportPost, TargetID: post.ID, Reason: "内容违规"})
+
+	failingServices := service.NewServices(&failReportPostCreditStore{Store: mem}, auth.NewPasswordHasher(), auth.NewSessionManager(time.Hour), nil, 10)
+	_, handleErr := failingServices.Report.Handle(ctx, admin, report.ID, model.HandleReportInput{Action: "accept", Note: "核实成立"})
+	if !errors.Is(handleErr, errReportPostCreditWrite) {
+		t.Fatalf("want reported post credit failure %q, got %v", errReportPostCreditWrite, handleErr)
+	}
+	storedReport, _ := mem.GetReport(ctx, report.ID)
+	storedPost, _ := mem.GetPost(ctx, post.ID)
+	if storedReport.Status != model.ReportPending || storedPost.Status != model.PostOpen {
+		t.Fatalf("failed post moderation left partial state: report=%s post=%s error=%v", storedReport.Status, storedPost.Status, handleErr)
 	}
 }
